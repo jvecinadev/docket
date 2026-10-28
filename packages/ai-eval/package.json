@@ -1,0 +1,8 @@
+{
+  "name": "@docket/ai-eval",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "eval": "uv run python run_eval.py"
+  }
+}
