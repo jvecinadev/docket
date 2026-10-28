@@ -7,5 +7,12 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint src --ext .ts",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.10.1",
+    "bcrypt": "^6.0.0",
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "zod": "^4.6.7"
   }
 }
