@@ -9,10 +9,25 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@google/genai": "^2.32.0",
+    "@huggingface/inference": "^4.13.32",
+    "@langfuse/client": "^6.0.2",
+    "@langfuse/otel": "^6.0.2",
+    "@langfuse/tracing": "^6.0.2",
+    "@opentelemetry/sdk-node": "^0.300.0",
     "@prisma/client": "^7.10.1",
     "bcrypt": "^6.0.0",
     "express": "^5.3.0",
     "jsonwebtoken": "^9.0.3",
     "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^26.6.6",
+    "prisma": "^7.10.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^6.0.3"
   }
 }
