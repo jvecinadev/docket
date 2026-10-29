@@ -1,0 +1,9 @@
+allowBuilds:
+  '@google/genai': false
+  '@prisma/engines': false
+  bcrypt: false
+  prisma: false
+  protobufjs: false
+minimumReleaseAgeExclude:
+  - '@google/genai@2.32.0'
+  - '@types/node@26.6.6'
