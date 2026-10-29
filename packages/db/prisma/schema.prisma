@@ -1,0 +1,266 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum WorkspaceRole {
+  OWNER
+  MEMBER
+  REVIEWER
+}
+
+enum DocumentStatus {
+  UPLOADED
+  PARSING
+  EXTRACTED
+  REVIEWED
+  FAILED
+}
+
+enum ModelRole {
+  TEACHER
+  STUDENT
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum ExtractionProvider {
+  GEMINI
+  HF
+  OTHER
+}
+
+model User {
+  id                   String            @id @default(uuid()) @db.Uuid
+  email                String            @unique
+  passwordHash         String
+  name                 String?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  ownedWorkspaces      Workspace[]       @relation("WorkspaceOwner")
+  memberships          WorkspaceMember[]
+  uploadedDocuments    Document[]        @relation("DocumentUploader")
+  reviewedCorrections  Correction[]      @relation("CorrectionReviewer")
+  createdSchemas       WorkspaceSchema[]  @relation("SchemaCreator")
+}
+
+model Workspace {
+  id              String            @id @default(uuid()) @db.Uuid
+  name            String
+  ownerId         String            @db.Uuid
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  owner           User              @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members         WorkspaceMember[]
+  schemas         WorkspaceSchema[]
+  documents       Document[]
+  trainingRuns    TrainingRun[]
+  evaluationRuns  EvaluationRun[]
+
+  @@index([ownerId])
+}
+
+model WorkspaceMember {
+  workspaceId String       @db.Uuid
+  userId      String       @db.Uuid
+  role        WorkspaceRole @default(MEMBER)
+  createdAt   DateTime     @default(now())
+
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, userId])
+  @@index([userId])
+}
+
+model WorkspaceSchema {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @db.Uuid
+  version     Int
+  name        String?
+  schemaJson  Json
+  isActive    Boolean  @default(false)
+  createdById String?  @db.Uuid
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy   User?     @relation("SchemaCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  extractionRuns ExtractionRun[]
+
+  @@unique([workspaceId, version])
+  @@index([workspaceId, isActive])
+}
+
+model Document {
+  id            String         @id @default(uuid()) @db.Uuid
+  workspaceId   String         @db.Uuid
+  uploadedById  String?        @db.Uuid
+  filename      String
+  storageUrl    String
+  mimeType      String?
+  pageCount     Int?
+  sha256        String?
+  status        DocumentStatus @default(UPLOADED)
+  errorMessage  String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  uploadedBy    User?          @relation("DocumentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  texts         DocumentText[]
+  extractionRuns ExtractionRun[]
+  corrections   Correction[]
+  evaluationResults EvaluationResult[]
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, status])
+  @@index([sha256])
+}
+
+model DocumentText {
+  id          String   @id @default(uuid()) @db.Uuid
+  documentId  String   @db.Uuid
+  source      String
+  text        String   @db.Text
+  createdAt   DateTime @default(now())
+
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, createdAt])
+}
+
+model ExtractionRun {
+  id            String           @id @default(uuid()) @db.Uuid
+  documentId    String           @db.Uuid
+  schemaId      String?          @db.Uuid
+  modelRole     ModelRole
+  provider      ExtractionProvider
+  modelName     String
+  promptVersion String
+  inputJson     Json?
+  outputJson    Json?
+  parsedOk      Boolean          @default(false)
+  status        RunStatus        @default(PENDING)
+  latencyMs     Int?
+  inputTokens   Int?
+  outputTokens  Int?
+  costUsd       Decimal?         @db.Decimal(10, 4)
+  traceId       String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  document      Document         @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  schema        WorkspaceSchema? @relation(fields: [schemaId], references: [id], onDelete: SetNull)
+  fieldValues   ExtractionFieldValue[]
+  corrections   Correction[]
+
+  @@index([documentId, createdAt])
+  @@index([modelRole, createdAt])
+  @@index([schemaId])
+}
+
+model ExtractionFieldValue {
+  id               String   @id @default(uuid()) @db.Uuid
+  extractionRunId  String   @db.Uuid
+  fieldKey         String
+  predictedValue   String?
+  normalizedValue   String?
+  confidence       Decimal? @db.Decimal(5, 4)
+  createdAt        DateTime @default(now())
+
+  extractionRun    ExtractionRun @relation(fields: [extractionRunId], references: [id], onDelete: Cascade)
+
+  @@unique([extractionRunId, fieldKey])
+  @@index([fieldKey])
+}
+
+model Correction {
+  id              String   @id @default(uuid()) @db.Uuid
+  documentId      String   @db.Uuid
+  extractionRunId  String?  @db.Uuid
+  reviewerId      String?   @db.Uuid
+  correctedJson   Json
+  isTrainingExample Boolean @default(true)
+  notes           String?
+  createdAt       DateTime  @default(now())
+
+  document        Document       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  extractionRun   ExtractionRun? @relation(fields: [extractionRunId], references: [id], onDelete: SetNull)
+  reviewer        User?          @relation("CorrectionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+
+  @@index([documentId, createdAt])
+  @@index([extractionRunId])
+}
+
+model TrainingRun {
+  id            String   @id @default(uuid()) @db.Uuid
+  workspaceId   String   @db.Uuid
+  baseModel     String
+  adapterPath   String?
+  datasetVersion String?
+  hyperparams   Json?
+  status        RunStatus @default(PENDING)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdAt     DateTime @default(now())
+
+  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  evaluations   EvaluationRun[]
+
+  @@index([workspaceId, createdAt])
+}
+
+model EvaluationRun {
+  id              String   @id @default(uuid()) @db.Uuid
+  workspaceId     String   @db.Uuid
+  trainingRunId   String?  @db.Uuid
+  gitSha          String?
+  modelVersion    String
+  datasetVersion  String?
+  fieldAccuracy   Decimal? @db.Decimal(5, 4)
+  exactMatchRate  Decimal? @db.Decimal(5, 4)
+  f1Score         Decimal? @db.Decimal(5, 4)
+  testSetSize     Int
+  passedGate      Boolean  @default(false)
+  status          RunStatus @default(PENDING)
+  metrics         Json?
+  createdAt       DateTime  @default(now())
+  finishedAt      DateTime?
+
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  trainingRun     TrainingRun? @relation(fields: [trainingRunId], references: [id], onDelete: SetNull)
+  results         EvaluationResult[]
+
+  @@index([workspaceId, createdAt])
+  @@index([trainingRunId])
+}
+
+model EvaluationResult {
+  id               String   @id @default(uuid()) @db.Uuid
+  evaluationRunId  String   @db.Uuid
+  documentId       String   @db.Uuid
+  fieldKey         String
+  expectedValue    String?
+  predictedValue   String?
+  isCorrect        Boolean
+  score            Decimal? @db.Decimal(5, 4)
+  notes            String?
+  createdAt        DateTime @default(now())
+
+  evaluationRun    EvaluationRun @relation(fields: [evaluationRunId], references: [id], onDelete: Cascade)
+  document         Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([evaluationRunId, fieldKey])
+  @@index([documentId])
+}
