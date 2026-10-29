@@ -1,7 +1,6 @@
 generator client {
   provider = "prisma-client-js"
 }
-
 datasource db {
   provider = "postgresql"
 }
@@ -18,6 +17,12 @@ enum DocumentStatus {
   EXTRACTED
   REVIEWED
   FAILED
+}
+
+enum DocumentTextSource {
+  PDF_TEXT
+  OCR
+  COMBINED
 }
 
 enum ModelRole {
@@ -39,26 +44,36 @@ enum ExtractionProvider {
 }
 
 model User {
-  id                   String            @id @default(uuid()) @db.Uuid
-  email                String            @unique
-  passwordHash         String
-  name                 String?
-  createdAt            DateTime          @default(now())
-  updatedAt            DateTime          @updatedAt
+  id                String     @id @default(uuid()) @db.Uuid
+  email             String     @unique
+  passwordHash      String
+  name              String?
+  emailVerifiedAt   DateTime?
+  lastLoginAt       DateTime?
+  failedLoginCount  Int        @default(0)
+  lockedUntil       DateTime?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
 
-  ownedWorkspaces      Workspace[]       @relation("WorkspaceOwner")
-  memberships          WorkspaceMember[]
-  uploadedDocuments    Document[]        @relation("DocumentUploader")
-  reviewedCorrections  Correction[]      @relation("CorrectionReviewer")
-  createdSchemas       WorkspaceSchema[]  @relation("SchemaCreator")
+  ownedWorkspaces   Workspace[] @relation("WorkspaceOwner")
+  memberships       WorkspaceMember[]
+  uploadedDocuments Document[]   @relation("DocumentUploader")
+  reviewedCorrections Correction[] @relation("CorrectionReviewer")
+  sessions          Session[]
+  emailVerifications EmailVerificationToken[]
+  passwordResets    PasswordResetToken[]
+  auditLogs         AuditLog[]   @relation("AuditActor")
+  createdSchemas    WorkspaceSchema[] @relation("SchemaCreator")
 }
 
 model Workspace {
   id              String            @id @default(uuid()) @db.Uuid
-  name            String
   ownerId         String            @db.Uuid
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
+  name            String
+  documentType    String
+  activeModel     String            @default("teacher")
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
 
   owner           User              @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
   members         WorkspaceMember[]
@@ -66,6 +81,7 @@ model Workspace {
   documents       Document[]
   trainingRuns    TrainingRun[]
   evaluationRuns  EvaluationRun[]
+  auditLogs       AuditLog[]
 
   @@index([ownerId])
 }
@@ -102,25 +118,71 @@ model WorkspaceSchema {
   @@index([workspaceId, isActive])
 }
 
-model Document {
-  id            String         @id @default(uuid()) @db.Uuid
-  workspaceId   String         @db.Uuid
-  uploadedById  String?        @db.Uuid
-  filename      String
-  storageUrl    String
-  mimeType      String?
-  pageCount     Int?
-  sha256        String?
-  status        DocumentStatus @default(UPLOADED)
-  errorMessage  String?
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+model Session {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  tokenHash   String   @unique
+  ipAddress   String?
+  userAgent   String?
+  lastUsedAt  DateTime?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
 
-  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  uploadedBy    User?          @relation("DocumentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
-  texts         DocumentText[]
-  extractionRuns ExtractionRun[]
-  corrections   Correction[]
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model EmailVerificationToken {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  tokenHash   String   @unique
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  tokenHash   String   @unique
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Document {
+  id              String         @id @default(uuid()) @db.Uuid
+  workspaceId     String         @db.Uuid
+  uploadedById    String?        @db.Uuid
+  filename        String
+  storageUrl      String
+  storageKey      String?
+  mimeType        String?
+  pageCount       Int?
+  sha256          String?
+  status          DocumentStatus @default(UPLOADED)
+  errorMessage    String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  workspace       Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  uploadedBy      User?          @relation("DocumentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  texts           DocumentText[]
+  extractionRuns  ExtractionRun[]
+  corrections     Correction[]
   evaluationResults EvaluationResult[]
 
   @@index([workspaceId, createdAt])
@@ -129,13 +191,13 @@ model Document {
 }
 
 model DocumentText {
-  id          String   @id @default(uuid()) @db.Uuid
-  documentId  String   @db.Uuid
-  source      String
-  text        String   @db.Text
-  createdAt   DateTime @default(now())
+  id          String            @id @default(uuid()) @db.Uuid
+  documentId  String            @db.Uuid
+  source      DocumentTextSource
+  text        String            @db.Text
+  createdAt   DateTime          @default(now())
 
-  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  document    Document          @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
   @@index([documentId, createdAt])
 }
@@ -157,6 +219,7 @@ model ExtractionRun {
   outputTokens  Int?
   costUsd       Decimal?         @db.Decimal(10, 4)
   traceId       String?
+  errorMessage  String?
   createdAt     DateTime         @default(now())
   updatedAt     DateTime         @updatedAt
 
@@ -171,96 +234,127 @@ model ExtractionRun {
 }
 
 model ExtractionFieldValue {
-  id               String   @id @default(uuid()) @db.Uuid
-  extractionRunId  String   @db.Uuid
-  fieldKey         String
-  predictedValue   String?
-  normalizedValue   String?
-  confidence       Decimal? @db.Decimal(5, 4)
-  createdAt        DateTime @default(now())
+  id              String   @id @default(uuid()) @db.Uuid
+  extractionRunId String   @db.Uuid
+  fieldKey        String
+  predictedValue  String?
+  normalizedValue String?
+  confidence      Decimal? @db.Decimal(5, 4)
+  createdAt       DateTime @default(now())
 
-  extractionRun    ExtractionRun @relation(fields: [extractionRunId], references: [id], onDelete: Cascade)
+  extractionRun   ExtractionRun @relation(fields: [extractionRunId], references: [id], onDelete: Cascade)
 
   @@unique([extractionRunId, fieldKey])
   @@index([fieldKey])
 }
 
 model Correction {
-  id              String   @id @default(uuid()) @db.Uuid
-  documentId      String   @db.Uuid
-  extractionRunId  String?  @db.Uuid
-  reviewerId      String?   @db.Uuid
-  correctedJson   Json
-  isTrainingExample Boolean @default(true)
-  notes           String?
-  createdAt       DateTime  @default(now())
+  id                String   @id @default(uuid()) @db.Uuid
+  documentId        String   @db.Uuid
+  extractionRunId   String?  @db.Uuid
+  reviewerId        String?  @db.Uuid
+  correctedJson     Json
+  isTrainingExample Boolean  @default(true)
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  document        Document       @relation(fields: [documentId], references: [id], onDelete: Cascade)
-  extractionRun   ExtractionRun? @relation(fields: [extractionRunId], references: [id], onDelete: SetNull)
-  reviewer        User?          @relation("CorrectionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  document          Document       @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  extractionRun     ExtractionRun? @relation(fields: [extractionRunId], references: [id], onDelete: SetNull)
+  reviewer          User?          @relation("CorrectionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
 
   @@index([documentId, createdAt])
   @@index([extractionRunId])
+  @@index([reviewerId])
 }
 
 model TrainingRun {
-  id            String   @id @default(uuid()) @db.Uuid
-  workspaceId   String   @db.Uuid
-  baseModel     String
-  adapterPath   String?
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @db.Uuid
+  baseModel      String
+  adapterPath    String?
   datasetVersion String?
-  hyperparams   Json?
-  status        RunStatus @default(PENDING)
-  startedAt     DateTime?
-  completedAt   DateTime?
-  createdAt     DateTime @default(now())
+  hyperparams    Json?
+  status         RunStatus @default(PENDING)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  errorMessage   String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  evaluations   EvaluationRun[]
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  evaluations    EvaluationRun[]
 
   @@index([workspaceId, createdAt])
+  @@index([status])
 }
 
 model EvaluationRun {
-  id              String   @id @default(uuid()) @db.Uuid
-  workspaceId     String   @db.Uuid
-  trainingRunId   String?  @db.Uuid
-  gitSha          String?
-  modelVersion    String
-  datasetVersion  String?
-  fieldAccuracy   Decimal? @db.Decimal(5, 4)
-  exactMatchRate  Decimal? @db.Decimal(5, 4)
-  f1Score         Decimal? @db.Decimal(5, 4)
-  testSetSize     Int
-  passedGate      Boolean  @default(false)
-  status          RunStatus @default(PENDING)
-  metrics         Json?
-  createdAt       DateTime  @default(now())
-  finishedAt      DateTime?
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @db.Uuid
+  trainingRunId  String?  @db.Uuid
+  gitSha         String?
+  modelVersion   String
+  datasetVersion String?
+  fieldAccuracy  Decimal? @db.Decimal(5, 4)
+  exactMatchRate Decimal? @db.Decimal(5, 4)
+  f1Score        Decimal? @db.Decimal(5, 4)
+  precision      Decimal? @db.Decimal(5, 4)
+  recall         Decimal? @db.Decimal(5, 4)
+  testSetSize    Int
+  passedGate     Boolean  @default(false)
+  status         RunStatus @default(PENDING)
+  metrics        Json?
+  thresholds     Json?
+  createdAt      DateTime @default(now())
+  finishedAt     DateTime?
 
-  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  trainingRun     TrainingRun? @relation(fields: [trainingRunId], references: [id], onDelete: SetNull)
-  results         EvaluationResult[]
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  trainingRun    TrainingRun? @relation(fields: [trainingRunId], references: [id], onDelete: SetNull)
+  results        EvaluationResult[]
 
   @@index([workspaceId, createdAt])
   @@index([trainingRunId])
+  @@index([status])
 }
 
 model EvaluationResult {
-  id               String   @id @default(uuid()) @db.Uuid
-  evaluationRunId  String   @db.Uuid
-  documentId       String   @db.Uuid
-  fieldKey         String
-  expectedValue    String?
-  predictedValue   String?
-  isCorrect        Boolean
-  score            Decimal? @db.Decimal(5, 4)
-  notes            String?
-  createdAt        DateTime @default(now())
+  id              String   @id @default(uuid()) @db.Uuid
+  evaluationRunId String   @db.Uuid
+  documentId      String   @db.Uuid
+  fieldKey        String
+  expectedValue   String?
+  predictedValue  String?
+  isCorrect       Boolean
+  score           Decimal? @db.Decimal(5, 4)
+  notes           String?
+  createdAt       DateTime @default(now())
 
-  evaluationRun    EvaluationRun @relation(fields: [evaluationRunId], references: [id], onDelete: Cascade)
-  document         Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  evaluationRun   EvaluationRun @relation(fields: [evaluationRunId], references: [id], onDelete: Cascade)
+  document        Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
+  @@unique([evaluationRunId, documentId, fieldKey])
   @@index([evaluationRunId, fieldKey])
   @@index([documentId])
+}
+
+model AuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  workspaceId  String?  @db.Uuid
+  actorUserId  String?  @db.Uuid
+  action       String
+  entityType   String
+  entityId     String?
+  metadata     Json?
+  ipAddress    String?
+  userAgent    String?
+  requestId    String?
+  createdAt    DateTime @default(now())
+
+  workspace    Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  actor        User?      @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([action, createdAt])
 }

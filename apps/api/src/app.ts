@@ -23,11 +23,5 @@ export function createApp() {
   app.use(express.urlencoded({ extended: true }));
   app.use(cookieParser());
 
-  app.use((_req, res) => {
-    res.status(404).json({ error: "Route not found" });
-  });
-
-  app.use(errorHandler);
-
   return app;
 }
