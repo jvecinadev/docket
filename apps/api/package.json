@@ -9,6 +9,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@google/genai": "^2.32.0",
+    "@huggingface/inference": "^4.13.32",
+    "@langfuse/client": "^6.0.2",
+    "@langfuse/otel": "^6.0.2",
+    "@langfuse/tracing": "^6.0.2",
+    "@opentelemetry/sdk-node": "^0.300.0",
     "@prisma/client": "^7.10.1",
     "bcrypt": "^6.0.0",
     "express": "^5.3.0",
