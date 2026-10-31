@@ -1,177 +1,342 @@
-import bcrypt from "bcrypt";
-import { randomBytes, createHash } from "node:crypto";
 import { prisma } from "@docket/db";
 import {
-  AUTH_SESSION_COOKIE_NAME,
-  SESSION_MAX_AGE_MS,
-  type AuthResponse,
+  AUTH_LOCK_DURATION_MS,
+  AUTH_MAX_FAILED_LOGIN_ATTEMPTS,
+  type ChangePasswordBody,
   type LoginBody,
   type PublicSession,
   type PublicUser,
   type RegisterBody,
+  type RequestPasswordResetBody,
+  type ResetPasswordBody,
+  type VerifyEmailBody,
 } from "@docket/types";
-import { AppError } from "../../utils/app-error";
+import type { Prisma, PrismaClient } from "@prisma/client";
+import { pbkdf2 as pbkdf2Callback, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import {
-  authRepository,
-  type SessionPublicRow,
-  type UserPublicRow,
-  type UserForLoginRow,
-} from "./auth.repository";
+  buildEmailVerificationExpiry,
+  buildPasswordResetExpiry,
+  buildSessionExpiry,
+  generateOpaqueToken,
+  hashToken,
+  normalizeEmail,
+  toPublicSession,
+  toPublicUser,
+} from "./auth.utils";
+import { authRepository } from "./auth.repository";
 
-const MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const LOCK_DURATION_MS = 15 * 60 * 1000;
+const pbkdf2 = promisify(pbkdf2Callback);
 
-const hashToken = (token: string) => {
-  return createHash("sha256").update(token).digest("hex");
+type DbClient = PrismaClient | Prisma.TransactionClient;
+
+type SessionMeta = {
+  ipAddress: string | null;
+  userAgent: string | null;
 };
 
-const generateSessionToken = () => {
-  return randomBytes(32).toString("hex");
+type AuthResult = {
+  user: PublicUser;
+  session: PublicSession;
+  sessionToken: string;
 };
 
-const toPublicUser = (user: UserPublicRow): PublicUser => ({
-  id: user.id,
-  email: user.email,
-  name: user.name,
-  emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
-  lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
-  createdAt: user.createdAt.toISOString(),
-  updatedAt: user.updatedAt.toISOString(),
-});
+const PASSWORD_ITERATIONS = 210_000;
+const PASSWORD_KEYLEN = 32;
+const PASSWORD_DIGEST = "sha512";
 
-const toPublicSession = (session: SessionPublicRow): PublicSession => ({
-  id: session.id,
-  ipAddress: session.ipAddress,
-  userAgent: session.userAgent,
-  lastUsedAt: session.lastUsedAt ? session.lastUsedAt.toISOString() : null,
-  expiresAt: session.expiresAt.toISOString(),
-  revokedAt: session.revokedAt ? session.revokedAt.toISOString() : null,
-  createdAt: session.createdAt.toISOString(),
-});
+const hashPassword = async (password: string) => {
+  const salt = randomBytes(16).toString("hex");
+  const derived = (await pbkdf2(
+    password,
+    salt,
+    PASSWORD_ITERATIONS,
+    PASSWORD_KEYLEN,
+    PASSWORD_DIGEST,
+  )) as Buffer;
 
-const buildSessionExpiry = () => {
-  return new Date(Date.now() + SESSION_MAX_AGE_MS);
+  return `pbkdf2$${PASSWORD_ITERATIONS}$${salt}$${derived.toString("hex")}`;
 };
 
-const createAuthResponse = (user: UserPublicRow, session: SessionPublicRow): AuthResponse => {
+const verifyPassword = async (password: string, storedHash: string) => {
+  const [scheme, iterationsStr, salt, expectedHex] = storedHash.split("$");
+
+  if (
+    scheme !== "pbkdf2" ||
+    !iterationsStr ||
+    !salt ||
+    !expectedHex ||
+    Number.isNaN(Number(iterationsStr))
+  ) {
+    return false;
+  }
+
+  const iterations = Number(iterationsStr);
+  const expected = Buffer.from(expectedHex, "hex");
+
+  const derived = (await pbkdf2(
+    password,
+    salt,
+    iterations,
+    expected.length,
+    PASSWORD_DIGEST,
+  )) as Buffer;
+
+  if (derived.length !== expected.length) {
+    return false;
+  }
+
+  return timingSafeEqual(derived, expected);
+};
+
+const createSessionResult = async (
+  db: DbClient,
+  userId: string,
+  meta: SessionMeta,
+): Promise<{ session: PublicSession; sessionToken: string }> => {
+  const sessionToken = generateOpaqueToken();
+
+  const session = await authRepository.createSession(db, {
+    userId,
+    tokenHash: hashToken(sessionToken),
+    ipAddress: meta.ipAddress,
+    userAgent: meta.userAgent,
+    expiresAt: buildSessionExpiry(),
+  });
+
   return {
-    user: toPublicUser(user),
     session: toPublicSession(session),
+    sessionToken,
   };
 };
 
 export const authService = {
-  register: async (
-    input: RegisterBody,
-    meta: {
-      ipAddress: string | null;
-      userAgent: string | null;
-    }
-  ) => {
-    const existing = await authRepository.findUserByEmail(input.email);
+  register: async (input: RegisterBody, meta: SessionMeta): Promise<AuthResult> => {
+    const email = normalizeEmail(input.email);
 
-    if (existing) {
-      throw new AppError(409, "Email already registered");
+    const existingUser = await authRepository.findUserByEmailWithSecrets(email);
+    if (existingUser) {
+      throw new Error("Email already in use");
     }
 
-    const passwordHash = await bcrypt.hash(input.password, 12);
-    const sessionToken = generateSessionToken();
-    const tokenHash = hashToken(sessionToken);
+    const passwordHash = await hashPassword(input.password);
+    const name = input.name.trim();
 
     const result = await prisma.$transaction(async (tx) => {
-      const user = await authRepository.createUser(tx, {
-        email: input.email,
-        name: input.name,
+      const createdUser = await authRepository.createUser(tx, {
+        email,
+        name,
         passwordHash,
       });
 
-      const session = await authRepository.createSession(tx, {
-        userId: user.id,
-        tokenHash,
-        ipAddress: meta.ipAddress,
-        userAgent: meta.userAgent,
-        expiresAt: buildSessionExpiry(),
-      });
+      const updatedUser = await authRepository.updateLoginSuccess(tx, createdUser.id);
+      const { session, sessionToken } = await createSessionResult(tx, createdUser.id, meta);
 
-      return { user, session };
+      return {
+        user: toPublicUser(updatedUser),
+        session,
+        sessionToken,
+      };
     });
 
-    return {
-      ...createAuthResponse(result.user, result.session),
-      sessionToken,
-    };
+    return result;
   },
 
-  login: async (
-    input: LoginBody,
-    meta: {
-      ipAddress: string | null;
-      userAgent: string | null;
-    }
-  ) => {
-    const user = await authRepository.findUserByEmail(input.email);
+  login: async (input: LoginBody, meta: SessionMeta): Promise<AuthResult> => {
+    const email = normalizeEmail(input.email);
+    const user = await authRepository.findUserByEmailWithSecrets(email);
 
     if (!user) {
-      throw new AppError(401, "Invalid email or password");
+      throw new Error("Invalid credentials");
     }
 
     if (user.lockedUntil && user.lockedUntil > new Date()) {
-      throw new AppError(423, "Account temporarily locked");
+      throw new Error("Account is temporarily locked");
     }
 
-    const validPassword = await bcrypt.compare(input.password, user.passwordHash);
-
+    const validPassword = await verifyPassword(input.password, user.passwordHash);
     if (!validPassword) {
-      const failedLoginCount = user.failedLoginCount + 1;
+      const failedCount = (user.failedLoginCount ?? 0) + 1;
       const lockedUntil =
-        failedLoginCount >= MAX_FAILED_LOGIN_ATTEMPTS
-          ? new Date(Date.now() + LOCK_DURATION_MS)
+        failedCount >= AUTH_MAX_FAILED_LOGIN_ATTEMPTS
+          ? new Date(Date.now() + AUTH_LOCK_DURATION_MS)
           : null;
 
-      await authRepository.updateLoginFailure(prisma, user.id, failedLoginCount, lockedUntil);
-
-      throw new AppError(401, "Invalid email or password");
+      await authRepository.updateLoginFailure(prisma, user.id, failedCount, lockedUntil);
+      throw new Error("Invalid credentials");
     }
-
-    const sessionToken = generateSessionToken();
-    const tokenHash = hashToken(sessionToken);
 
     const result = await prisma.$transaction(async (tx) => {
       const updatedUser = await authRepository.updateLoginSuccess(tx, user.id);
+      const { session, sessionToken } = await createSessionResult(tx, user.id, meta);
 
-      const session = await authRepository.createSession(tx, {
-        userId: user.id,
-        tokenHash,
-        ipAddress: meta.ipAddress,
-        userAgent: meta.userAgent,
-        expiresAt: buildSessionExpiry(),
-      });
+      return {
+        user: toPublicUser(updatedUser),
+        session,
+        sessionToken,
+      };
+    });
 
-      return { user: updatedUser, session };
+    return result;
+  },
+
+  refresh: async (sessionToken: string): Promise<AuthResult> => {
+    const tokenHash = hashToken(sessionToken);
+    const session = await authRepository.findActiveSessionByTokenHash(tokenHash);
+
+    if (!session) {
+      throw new Error("Invalid session");
+    }
+
+    const nextToken = generateOpaqueToken();
+
+    const rotatedSession = await prisma.$transaction(async (tx) => {
+      return authRepository.rotateSessionToken(
+        tx,
+        session.id,
+        hashToken(nextToken),
+        buildSessionExpiry(),
+      );
     });
 
     return {
-      ...createAuthResponse(result.user, result.session),
-      sessionToken,
+      user: toPublicUser(session.user),
+      session: toPublicSession(rotatedSession),
+      sessionToken: nextToken,
     };
   },
 
-  logout: async (sessionToken: string | null | undefined) => {
-    if (!sessionToken) {
-      return;
-    }
-
+  logout: async (sessionToken: string): Promise<void> => {
     const tokenHash = hashToken(sessionToken);
     await authRepository.revokeSessionByTokenHash(prisma, tokenHash);
   },
 
-  getCurrentUser: async (userId: string) => {
-    const user = await authRepository.findUserById(userId);
+  logoutAll: async (userId: string): Promise<void> => {
+    await authRepository.revokeAllSessionsByUserId(prisma, userId);
+  },
+
+  me: async (userId: string): Promise<PublicUser> => {
+    const user = await authRepository.findPublicUserById(userId);
 
     if (!user) {
-      throw new AppError(404, "User not found");
+      throw new Error("User not found");
     }
 
     return toPublicUser(user);
+  },
+
+  listSessions: async (userId: string): Promise<PublicSession[]> => {
+    const sessions = await authRepository.listActiveSessionsByUserId(userId);
+    return sessions.map(toPublicSession);
+  },
+
+  revokeSession: async (userId: string, sessionId: string): Promise<void> => {
+    const session = await authRepository.findSessionByIdAndUserId(userId, sessionId);
+
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    await authRepository.revokeSessionById(prisma, userId, sessionId);
+  },
+
+  changePassword: async (userId: string, input: ChangePasswordBody): Promise<void> => {
+    const user = await authRepository.findUserByIdWithSecrets(userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const validCurrentPassword = await verifyPassword(
+      input.currentPassword,
+      user.passwordHash,
+    );
+
+    if (!validCurrentPassword) {
+      throw new Error("Current password is incorrect");
+    }
+
+    const nextPasswordHash = await hashPassword(input.newPassword);
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.updateUserPassword(tx, userId, nextPasswordHash);
+      await authRepository.revokeAllSessionsByUserId(tx, userId);
+    });
+  },
+
+  requestPasswordReset: async (input: RequestPasswordResetBody): Promise<void> => {
+    const email = normalizeEmail(input.email);
+    const user = await authRepository.findUserByEmailWithSecrets(email);
+
+    if (!user) {
+      return;
+    }
+
+    const token = generateOpaqueToken();
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.clearPasswordResetTokensByUserId(tx, user.id);
+      await authRepository.createPasswordResetToken(tx, {
+        userId: user.id,
+        tokenHash: hashToken(token),
+        expiresAt: buildPasswordResetExpiry(),
+      });
+    });
+
+    // Send `token` via email in your mailer layer.
+  },
+
+  confirmPasswordReset: async (input: ResetPasswordBody): Promise<void> => {
+    const tokenHash = hashToken(input.token);
+    const token = await authRepository.findValidPasswordResetTokenByHash(tokenHash);
+
+    if (!token) {
+      throw new Error("Invalid or expired reset token");
+    }
+
+    const nextPasswordHash = await hashPassword(input.newPassword);
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.consumePasswordResetToken(tx, token.id);
+      await authRepository.updateUserPassword(tx, token.userId, nextPasswordHash);
+      await authRepository.revokeAllSessionsByUserId(tx, token.userId);
+      await authRepository.clearPasswordResetTokensByUserId(tx, token.userId);
+    });
+  },
+
+  requestEmailVerification: async (userId: string): Promise<void> => {
+    const user = await authRepository.findPublicUserById(userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const token = generateOpaqueToken();
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.clearEmailVerificationTokensByUserId(tx, userId);
+      await authRepository.createEmailVerificationToken(tx, {
+        userId,
+        tokenHash: hashToken(token),
+        expiresAt: buildEmailVerificationExpiry(),
+      });
+    });
+
+    // Send `token` via email in your mailer layer.
+  },
+
+  confirmEmailVerification: async (input: VerifyEmailBody): Promise<void> => {
+    const tokenHash = hashToken(input.token);
+    const token = await authRepository.findValidEmailVerificationTokenByHash(tokenHash);
+
+    if (!token) {
+      throw new Error("Invalid or expired verification token");
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.consumeEmailVerificationToken(tx, token.id);
+      await authRepository.markUserEmailVerified(tx, token.userId);
+      await authRepository.clearEmailVerificationTokensByUserId(tx, token.userId);
+    });
   },
 };

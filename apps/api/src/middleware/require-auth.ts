@@ -1,12 +1,12 @@
+import { prisma } from "@docket/db";
 import type { NextFunction, Request, Response } from "express";
-import { AUTH_SESSION_COOKIE_NAME } from "@docket/types";
-import { authRepository } from "../modules/auth/auth.repository";
 import { AppError } from "../utils/app-error";
-import { createHash } from "node:crypto";
-
-const hashToken = (token: string) => {
-  return createHash("sha256").update(token).digest("hex");
-};
+import { authRepository } from "../modules/auth/auth.repository";
+import {
+  extractSessionToken,
+  toPublicAuthContext,
+  hashToken,
+} from "../modules/auth/auth.utils";
 
 export const requireAuth = async (
   req: Request,
@@ -14,31 +14,27 @@ export const requireAuth = async (
   next: NextFunction
 ) => {
   try {
-    const sessionToken = req.cookies?.[AUTH_SESSION_COOKIE_NAME] as string | undefined;
+    const sessionToken = extractSessionToken(req);
 
     if (!sessionToken) {
-      return next(new AppError(401, "Unauthorized"));
+      return next(new AppError(401, "Unauthorized", "UNAUTHORIZED"));
     }
 
-    const session = await authRepository.findSessionWithUserByTokenHash(
+    const session = await authRepository.findActiveSessionByTokenHash(
       hashToken(sessionToken)
     );
 
     if (!session) {
-      return next(new AppError(401, "Unauthorized"));
+      return next(new AppError(401, "Unauthorized", "UNAUTHORIZED"));
     }
 
-    await authRepository.touchSession(require("@docket/db").prisma, session.id);
+    await authRepository.touchSession(prisma, session.id);
 
-    req.user = {
-      ...session.user,
-      emailVerifiedAt: session.user.emailVerifiedAt?.toISOString() ?? null,
-      lastLoginAt: session.user.lastLoginAt?.toISOString() ?? null,
-      createdAt: session.user.createdAt.toISOString(),
-      updatedAt: session.user.updatedAt.toISOString(),
-    };
-    next();
+    req.auth = toPublicAuthContext(session);
+    req.user = req.auth.user;
+
+    return next();
   } catch {
-    next(new AppError(401, "Unauthorized"));
+    return next(new AppError(401, "Unauthorized", "UNAUTHORIZED"));
   }
 };

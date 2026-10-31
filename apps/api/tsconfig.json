@@ -6,6 +6,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
   },
+  "paths": {
+      "@prisma/client": ["../../packages/db/node_modules/@prisma/client"]
+    },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
