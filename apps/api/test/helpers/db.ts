@@ -16,7 +16,3 @@ export async function truncateAll(): Promise<void> {
     `TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`
   );
 }
-
-export async function disconnect(): Promise<void> {
-  await prisma.$disconnect();
-}

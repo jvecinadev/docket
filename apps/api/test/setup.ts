@@ -1,13 +1,10 @@
-import { truncateAll, disconnect } from '@test/helpers/db';
-
-beforeAll(async () => {
-  // one-time: run migrations, start containers, etc.
-});
+import { prisma } from '@docket/db';
+import { truncateAll } from '@test/helpers/db';
 
 beforeEach(async () => {
   await truncateAll();
 });
 
 afterAll(async () => {
-  await disconnect();
+  await prisma.$disconnect();
 });
