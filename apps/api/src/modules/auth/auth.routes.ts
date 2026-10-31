@@ -26,7 +26,7 @@ import {
   revokeSession,
 } from "./auth.controller";
 
-export const authRouter = Router();
+const authRouter = Router();
 
 authRouter.post("/register", validateBody(registerBodySchema), register);
 authRouter.post("/login", validateBody(loginBodySchema), login);
@@ -74,3 +74,5 @@ authRouter.post(
   validateBody(verifyEmailBodySchema),
   confirmEmailVerification,
 );
+
+export default authRouter;
