@@ -1,16 +1,19 @@
-import bcrypt from "bcrypt";
-import type { Prisma } from "@prisma/client";
 import { prisma } from "@docket/db";
-import type { PublicSession, PublicUser } from "@docket/types";
-import { AppError } from "../../utils/app-error";
-import { auditService } from "../audit/audit.service";
 import {
-  authRepository,
-  type SessionPublicRow,
-  type SessionWithUserRow,
-  type UserPublicRow,
-  type UserWithSecretsRow,
-} from "./auth.repository";
+  AUTH_LOCK_DURATION_MS,
+  AUTH_MAX_FAILED_LOGIN_ATTEMPTS,
+  type ChangePasswordBody,
+  type LoginBody,
+  type PublicSession,
+  type PublicUser,
+  type RegisterBody,
+  type RequestPasswordResetBody,
+  type ResetPasswordBody,
+  type VerifyEmailBody,
+} from "@docket/types";
+import type { Prisma, PrismaClient } from "@prisma/client";
+import { pbkdf2 as pbkdf2Callback, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import {
   buildEmailVerificationExpiry,
   buildPasswordResetExpiry,
@@ -21,556 +24,319 @@ import {
   toPublicSession,
   toPublicUser,
 } from "./auth.utils";
+import { authRepository } from "./auth.repository";
 
-const AUTH_MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const AUTH_LOCK_DURATION_MS = 15 * 60 * 1000;
+const pbkdf2 = promisify(pbkdf2Callback);
 
-const AUTH_AUDIT_ACTIONS = {
-  REGISTERED: "USER_REGISTERED",
-  LOGGED_IN: "USER_LOGGED_IN",
-  LOGIN_FAILED: "USER_LOGIN_FAILED",
-  LOGIN_BLOCKED: "USER_LOGIN_BLOCKED",
-  LOGGED_OUT: "USER_LOGGED_OUT",
-  LOGGED_OUT_ALL: "USER_LOGGED_OUT_ALL",
-  SESSION_REFRESHED: "SESSION_REFRESHED",
-  SESSION_REVOKED: "SESSION_REVOKED",
-  EMAIL_VERIFICATION_REQUESTED: "EMAIL_VERIFICATION_REQUESTED",
-  EMAIL_VERIFIED: "EMAIL_VERIFIED",
-  PASSWORD_RESET_REQUESTED: "PASSWORD_RESET_REQUESTED",
-  PASSWORD_RESET_COMPLETED: "PASSWORD_RESET_COMPLETED",
-  PASSWORD_CHANGED: "PASSWORD_CHANGED",
-} as const;
+type DbClient = PrismaClient | Prisma.TransactionClient;
 
-type RequestMeta = {
+type SessionMeta = {
   ipAddress: string | null;
   userAgent: string | null;
-  requestId: string | null;
 };
 
 type AuthResult = {
   user: PublicUser;
   session: PublicSession;
   sessionToken: string;
-  verificationToken?: string;
 };
 
-type TokenRequestResult = {
-  ok: true;
-  verificationToken?: string;
-  resetToken?: string;
+const PASSWORD_ITERATIONS = 210_000;
+const PASSWORD_KEYLEN = 32;
+const PASSWORD_DIGEST = "sha512";
+
+const hashPassword = async (password: string) => {
+  const salt = randomBytes(16).toString("hex");
+  const derived = (await pbkdf2(
+    password,
+    salt,
+    PASSWORD_ITERATIONS,
+    PASSWORD_KEYLEN,
+    PASSWORD_DIGEST,
+  )) as Buffer;
+
+  return `pbkdf2$${PASSWORD_ITERATIONS}$${salt}$${derived.toString("hex")}`;
 };
 
-const safeAuditLog = (input: {
-  action: string;
-  entityType: string;
-  entityId?: string | null;
-  actorUserId?: string | null;
-  metadata?: Record<string, unknown>;
-  meta: RequestMeta;
-}) => {
-  void auditService
-    .log({
-      workspaceId: null,
-      actorUserId: input.actorUserId ?? null,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId ?? null,
-      metadata: input.metadata as Prisma.InputJsonObject | undefined,
-      ipAddress: input.meta.ipAddress,
-      userAgent: input.meta.userAgent,
-      requestId: input.meta.requestId,
-    })
-    .catch((error) => {
-      console.error("Audit log failed:", error);
-    });
+const verifyPassword = async (password: string, storedHash: string) => {
+  const [scheme, iterationsStr, salt, expectedHex] = storedHash.split("$");
+
+  if (
+    scheme !== "pbkdf2" ||
+    !iterationsStr ||
+    !salt ||
+    !expectedHex ||
+    Number.isNaN(Number(iterationsStr))
+  ) {
+    return false;
+  }
+
+  const iterations = Number(iterationsStr);
+  const expected = Buffer.from(expectedHex, "hex");
+
+  const derived = (await pbkdf2(
+    password,
+    salt,
+    iterations,
+    expected.length,
+    PASSWORD_DIGEST,
+  )) as Buffer;
+
+  if (derived.length !== expected.length) {
+    return false;
+  }
+
+  return timingSafeEqual(derived, expected);
 };
 
-const buildAuthResult = (
-  user: UserPublicRow,
-  session: SessionPublicRow,
-  sessionToken: string,
-  verificationToken?: string
-): AuthResult => {
+const createSessionResult = async (
+  db: DbClient,
+  userId: string,
+  meta: SessionMeta,
+): Promise<{ session: PublicSession; sessionToken: string }> => {
+  const sessionToken = generateOpaqueToken();
+
+  const session = await authRepository.createSession(db, {
+    userId,
+    tokenHash: hashToken(sessionToken),
+    ipAddress: meta.ipAddress,
+    userAgent: meta.userAgent,
+    expiresAt: buildSessionExpiry(),
+  });
+
   return {
-    user: toPublicUser(user),
     session: toPublicSession(session),
     sessionToken,
-    verificationToken,
   };
 };
 
-const buildDevTokenResult = (tokenKey: "verificationToken" | "resetToken", token?: string) => {
-  if (!token) return {};
-  return {
-    [tokenKey]: token,
-  } as Record<string, string>;
-};
-
 export const authService = {
-  register: async (input: { name: string; email: string; password: string }, meta: RequestMeta) => {
+  register: async (input: RegisterBody, meta: SessionMeta): Promise<AuthResult> => {
     const email = normalizeEmail(input.email);
 
-    const existing = await authRepository.findUserByEmailWithSecrets(email);
-
-    if (existing) {
-      throw new AppError(409, "Email already registered", "EMAIL_TAKEN");
+    const existingUser = await authRepository.findUserByEmailWithSecrets(email);
+    if (existingUser) {
+      throw new Error("Email already in use");
     }
 
-    const passwordHash = await bcrypt.hash(input.password, 12);
-    const sessionToken = generateOpaqueToken();
-    const verificationToken = generateOpaqueToken();
+    const passwordHash = await hashPassword(input.password);
+    const name = input.name.trim();
 
     const result = await prisma.$transaction(async (tx) => {
-      const user = await authRepository.createUser(tx, {
+      const createdUser = await authRepository.createUser(tx, {
         email,
-        name: input.name,
+        name,
         passwordHash,
       });
 
-      const activatedUser = await authRepository.updateLoginSuccess(tx, user.id);
-
-      const session = await authRepository.createSession(tx, {
-        userId: activatedUser.id,
-        tokenHash: hashToken(sessionToken),
-        ipAddress: meta.ipAddress,
-        userAgent: meta.userAgent,
-        expiresAt: buildSessionExpiry(),
-        lastUsedAt: new Date(),
-      });
-
-      await authRepository.createEmailVerificationToken(tx, {
-        userId: activatedUser.id,
-        tokenHash: hashToken(verificationToken),
-        expiresAt: buildEmailVerificationExpiry(),
-      });
+      const updatedUser = await authRepository.updateLoginSuccess(tx, createdUser.id);
+      const { session, sessionToken } = await createSessionResult(tx, createdUser.id, meta);
 
       return {
-        user: activatedUser,
+        user: toPublicUser(updatedUser),
         session,
+        sessionToken,
       };
     });
 
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.REGISTERED,
-      entityType: "User",
-      entityId: result.user.id,
-      actorUserId: result.user.id,
-      metadata: {
-        emailVerified: false,
-      },
-      meta,
-    });
-
-    return buildAuthResult(result.user, result.session, sessionToken, verificationToken);
+    return result;
   },
 
-  login: async (input: { email: string; password: string }, meta: RequestMeta) => {
+  login: async (input: LoginBody, meta: SessionMeta): Promise<AuthResult> => {
     const email = normalizeEmail(input.email);
-
     const user = await authRepository.findUserByEmailWithSecrets(email);
 
     if (!user) {
-      throw new AppError(401, "Invalid email or password", "INVALID_CREDENTIALS");
+      throw new Error("Invalid credentials");
     }
 
     if (user.lockedUntil && user.lockedUntil > new Date()) {
-      safeAuditLog({
-        action: AUTH_AUDIT_ACTIONS.LOGIN_BLOCKED,
-        entityType: "User",
-        entityId: user.id,
-        actorUserId: user.id,
-        metadata: {
-          lockedUntil: user.lockedUntil.toISOString(),
-        },
-        meta,
-      });
-
-      throw new AppError(423, "Account temporarily locked", "ACCOUNT_LOCKED");
+      throw new Error("Account is temporarily locked");
     }
 
-    const validPassword = await bcrypt.compare(input.password, user.passwordHash);
-
+    const validPassword = await verifyPassword(input.password, user.passwordHash);
     if (!validPassword) {
-      const failedLoginCount = user.failedLoginCount + 1;
+      const failedCount = (user.failedLoginCount ?? 0) + 1;
       const lockedUntil =
-        failedLoginCount >= AUTH_MAX_FAILED_LOGIN_ATTEMPTS
+        failedCount >= AUTH_MAX_FAILED_LOGIN_ATTEMPTS
           ? new Date(Date.now() + AUTH_LOCK_DURATION_MS)
           : null;
 
-      await authRepository.updateLoginFailure(prisma, user.id, failedLoginCount, lockedUntil);
-
-      safeAuditLog({
-        action: AUTH_AUDIT_ACTIONS.LOGIN_FAILED,
-        entityType: "User",
-        entityId: user.id,
-        actorUserId: user.id,
-        metadata: {
-          failedLoginCount,
-          lockedUntil: lockedUntil ? lockedUntil.toISOString() : null,
-        },
-        meta,
-      });
-
-      throw new AppError(401, "Invalid email or password", "INVALID_CREDENTIALS");
+      await authRepository.updateLoginFailure(prisma, user.id, failedCount, lockedUntil);
+      throw new Error("Invalid credentials");
     }
-
-    const sessionToken = generateOpaqueToken();
 
     const result = await prisma.$transaction(async (tx) => {
       const updatedUser = await authRepository.updateLoginSuccess(tx, user.id);
-
-      const session = await authRepository.createSession(tx, {
-        userId: user.id,
-        tokenHash: hashToken(sessionToken),
-        ipAddress: meta.ipAddress,
-        userAgent: meta.userAgent,
-        expiresAt: buildSessionExpiry(),
-        lastUsedAt: new Date(),
-      });
+      const { session, sessionToken } = await createSessionResult(tx, user.id, meta);
 
       return {
-        user: updatedUser,
+        user: toPublicUser(updatedUser),
         session,
+        sessionToken,
       };
     });
 
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.LOGGED_IN,
-      entityType: "Session",
-      entityId: result.session.id,
-      actorUserId: result.user.id,
-      metadata: {
-        email,
-      },
-      meta,
-    });
-
-    return buildAuthResult(result.user, result.session, sessionToken);
+    return result;
   },
 
-  refresh: async (sessionToken: string | null | undefined, meta: RequestMeta) => {
-    if (!sessionToken) {
-      throw new AppError(401, "Unauthorized", "UNAUTHORIZED");
-    }
-
+  refresh: async (sessionToken: string): Promise<AuthResult> => {
     const tokenHash = hashToken(sessionToken);
-    const currentSession = await authRepository.findActiveSessionByTokenHash(tokenHash);
+    const session = await authRepository.findActiveSessionByTokenHash(tokenHash);
 
-    if (!currentSession) {
-      throw new AppError(401, "Unauthorized", "UNAUTHORIZED");
+    if (!session) {
+      throw new Error("Invalid session");
     }
 
-    const newSessionToken = generateOpaqueToken();
+    const nextToken = generateOpaqueToken();
 
-    const rotatedSession = await authRepository.rotateSessionToken(
-      prisma,
-      currentSession.id,
-      hashToken(newSessionToken),
-      buildSessionExpiry()
-    );
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.SESSION_REFRESHED,
-      entityType: "Session",
-      entityId: currentSession.id,
-      actorUserId: currentSession.user.id,
-      metadata: {
-        rotated: true,
-      },
-      meta,
-    });
-
-    return buildAuthResult(
-      currentSession.user,
-      rotatedSession,
-      newSessionToken
-    );
-  },
-
-  logout: async (
-    sessionToken: string | null | undefined,
-    meta: RequestMeta
-  ): Promise<{ revoked: boolean }> => {
-    if (!sessionToken) {
-      return { revoked: false };
-    }
-
-    const tokenHash = hashToken(sessionToken);
-    const currentSession = await authRepository.findActiveSessionByTokenHash(tokenHash);
-
-    if (!currentSession) {
-      return { revoked: false };
-    }
-
-    await authRepository.revokeSessionByTokenHash(prisma, tokenHash);
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.LOGGED_OUT,
-      entityType: "Session",
-      entityId: currentSession.id,
-      actorUserId: currentSession.user.id,
-      metadata: {},
-      meta,
-    });
-
-    return { revoked: true };
-  },
-
-  logoutAll: async (userId: string, meta: RequestMeta) => {
-    const result = await authRepository.revokeAllSessionsByUserId(prisma, userId);
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.LOGGED_OUT_ALL,
-      entityType: "User",
-      entityId: userId,
-      actorUserId: userId,
-      metadata: {
-        revokedCount: result.count,
-      },
-      meta,
+    const rotatedSession = await prisma.$transaction(async (tx) => {
+      return authRepository.rotateSessionToken(
+        tx,
+        session.id,
+        hashToken(nextToken),
+        buildSessionExpiry(),
+      );
     });
 
     return {
-      revokedCount: result.count,
+      user: toPublicUser(session.user),
+      session: toPublicSession(rotatedSession),
+      sessionToken: nextToken,
     };
   },
 
-  listSessions: async (userId: string) => {
-    const sessions = await authRepository.listActiveSessionsByUserId(userId);
-    return sessions.map((session) => toPublicSession(session));
+  logout: async (sessionToken: string): Promise<void> => {
+    const tokenHash = hashToken(sessionToken);
+    await authRepository.revokeSessionByTokenHash(prisma, tokenHash);
   },
 
-  revokeSession: async (userId: string, sessionId: string, meta: RequestMeta) => {
-    const existing = await authRepository.findSessionByIdAndUserId(userId, sessionId);
+  logoutAll: async (userId: string): Promise<void> => {
+    await authRepository.revokeAllSessionsByUserId(prisma, userId);
+  },
 
-    if (!existing) {
-      throw new AppError(404, "Session not found", "SESSION_NOT_FOUND");
+  me: async (userId: string): Promise<PublicUser> => {
+    const user = await authRepository.findPublicUserById(userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    return toPublicUser(user);
+  },
+
+  listSessions: async (userId: string): Promise<PublicSession[]> => {
+    const sessions = await authRepository.listActiveSessionsByUserId(userId);
+    return sessions.map(toPublicSession);
+  },
+
+  revokeSession: async (userId: string, sessionId: string): Promise<void> => {
+    const session = await authRepository.findSessionByIdAndUserId(userId, sessionId);
+
+    if (!session) {
+      throw new Error("Session not found");
     }
 
     await authRepository.revokeSessionById(prisma, userId, sessionId);
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.SESSION_REVOKED,
-      entityType: "Session",
-      entityId: sessionId,
-      actorUserId: userId,
-      metadata: {},
-      meta,
-    });
-
-    return { revoked: true };
   },
 
-  changePassword: async (
-    input: { currentPassword: string; newPassword: string },
-    userId: string,
-    currentSessionId: string,
-    meta: RequestMeta
-  ) => {
+  changePassword: async (userId: string, input: ChangePasswordBody): Promise<void> => {
     const user = await authRepository.findUserByIdWithSecrets(userId);
 
     if (!user) {
-      throw new AppError(404, "User not found", "USER_NOT_FOUND");
+      throw new Error("User not found");
     }
 
-    const validPassword = await bcrypt.compare(input.currentPassword, user.passwordHash);
+    const validCurrentPassword = await verifyPassword(
+      input.currentPassword,
+      user.passwordHash,
+    );
 
-    if (!validPassword) {
-      throw new AppError(401, "Current password is incorrect", "INVALID_CREDENTIALS");
+    if (!validCurrentPassword) {
+      throw new Error("Current password is incorrect");
     }
 
-    const newPasswordHash = await bcrypt.hash(input.newPassword, 12);
-    const newSessionToken = generateOpaqueToken();
+    const nextPasswordHash = await hashPassword(input.newPassword);
 
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedUser = await authRepository.updateUserPassword(tx, userId, newPasswordHash);
-
-      const rotatedSession = await authRepository.rotateSessionToken(
-        tx,
-        currentSessionId,
-        hashToken(newSessionToken),
-        buildSessionExpiry()
-      );
-
-      const revokedOthers = await authRepository.revokeAllOtherSessionsByUserId(
-        tx,
-        userId,
-        currentSessionId
-      );
-
-      await authRepository.clearPasswordResetTokensByUserId(tx, userId);
-
-      return {
-        user: updatedUser,
-        session: rotatedSession,
-        revokedCount: revokedOthers.count,
-      };
+    await prisma.$transaction(async (tx) => {
+      await authRepository.updateUserPassword(tx, userId, nextPasswordHash);
+      await authRepository.revokeAllSessionsByUserId(tx, userId);
     });
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.PASSWORD_CHANGED,
-      entityType: "User",
-      entityId: userId,
-      actorUserId: userId,
-      metadata: {
-        revokedCount: result.revokedCount,
-      },
-      meta,
-    });
-
-    return buildAuthResult(result.user, result.session, newSessionToken);
   },
 
-  requestPasswordReset: async (
-    input: { email: string },
-    meta: RequestMeta
-  ): Promise<TokenRequestResult> => {
+  requestPasswordReset: async (input: RequestPasswordResetBody): Promise<void> => {
     const email = normalizeEmail(input.email);
     const user = await authRepository.findUserByEmailWithSecrets(email);
 
     if (!user) {
-      return { ok: true };
+      return;
     }
 
-    const resetToken = generateOpaqueToken();
+    const token = generateOpaqueToken();
 
     await prisma.$transaction(async (tx) => {
       await authRepository.clearPasswordResetTokensByUserId(tx, user.id);
-
       await authRepository.createPasswordResetToken(tx, {
         userId: user.id,
-        tokenHash: hashToken(resetToken),
+        tokenHash: hashToken(token),
         expiresAt: buildPasswordResetExpiry(),
       });
     });
 
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.PASSWORD_RESET_REQUESTED,
-      entityType: "User",
-      entityId: user.id,
-      actorUserId: user.id,
-      metadata: {},
-      meta,
-    });
-
-    return {
-      ok: true,
-      resetToken,
-    };
+    // Send `token` via email in your mailer layer.
   },
 
-  resetPassword: async (
-    input: { token: string; password: string },
-    meta: RequestMeta
-  ) => {
+  confirmPasswordReset: async (input: ResetPasswordBody): Promise<void> => {
     const tokenHash = hashToken(input.token);
-    const resetToken = await authRepository.findValidPasswordResetTokenByHash(tokenHash);
+    const token = await authRepository.findValidPasswordResetTokenByHash(tokenHash);
 
-    if (!resetToken) {
-      throw new AppError(400, "Invalid or expired reset token", "INVALID_TOKEN");
+    if (!token) {
+      throw new Error("Invalid or expired reset token");
     }
 
-    const newPasswordHash = await bcrypt.hash(input.password, 12);
-
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedUser = await authRepository.updateUserPassword(
-        tx,
-        resetToken.userId,
-        newPasswordHash
-      );
-
-      const consumed = await authRepository.consumePasswordResetToken(tx, resetToken.id);
-      const revokedSessions = await authRepository.revokeAllSessionsByUserId(
-        tx,
-        resetToken.userId
-      );
-
-      return {
-        user: updatedUser,
-        consumed,
-        revokedCount: revokedSessions.count,
-      };
-    });
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.PASSWORD_RESET_COMPLETED,
-      entityType: "User",
-      entityId: resetToken.userId,
-      actorUserId: resetToken.userId,
-      metadata: {
-        revokedCount: result.revokedCount,
-      },
-      meta,
-    });
-
-    return { ok: true };
-  },
-
-  requestEmailVerification: async (
-    input: { email: string },
-    meta: RequestMeta
-  ): Promise<TokenRequestResult> => {
-    const email = normalizeEmail(input.email);
-    const user = await authRepository.findUserByEmailWithSecrets(email);
-
-    if (!user || user.emailVerifiedAt) {
-      return { ok: true };
-    }
-
-    const verificationToken = generateOpaqueToken();
+    const nextPasswordHash = await hashPassword(input.newPassword);
 
     await prisma.$transaction(async (tx) => {
-      await authRepository.clearEmailVerificationTokensByUserId(tx, user.id);
+      await authRepository.consumePasswordResetToken(tx, token.id);
+      await authRepository.updateUserPassword(tx, token.userId, nextPasswordHash);
+      await authRepository.revokeAllSessionsByUserId(tx, token.userId);
+      await authRepository.clearPasswordResetTokensByUserId(tx, token.userId);
+    });
+  },
 
+  requestEmailVerification: async (userId: string): Promise<void> => {
+    const user = await authRepository.findPublicUserById(userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const token = generateOpaqueToken();
+
+    await prisma.$transaction(async (tx) => {
+      await authRepository.clearEmailVerificationTokensByUserId(tx, userId);
       await authRepository.createEmailVerificationToken(tx, {
-        userId: user.id,
-        tokenHash: hashToken(verificationToken),
+        userId,
+        tokenHash: hashToken(token),
         expiresAt: buildEmailVerificationExpiry(),
       });
     });
 
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.EMAIL_VERIFICATION_REQUESTED,
-      entityType: "User",
-      entityId: user.id,
-      actorUserId: user.id,
-      metadata: {},
-      meta,
-    });
-
-    return {
-      ok: true,
-      verificationToken,
-    };
+    // Send `token` via email in your mailer layer.
   },
 
-  verifyEmail: async (
-    input: { token: string },
-    meta: RequestMeta
-  ) => {
+  confirmEmailVerification: async (input: VerifyEmailBody): Promise<void> => {
     const tokenHash = hashToken(input.token);
-    const verificationToken = await authRepository.findValidEmailVerificationTokenByHash(
-      tokenHash
-    );
+    const token = await authRepository.findValidEmailVerificationTokenByHash(tokenHash);
 
-    if (!verificationToken) {
-      throw new AppError(400, "Invalid or expired verification token", "INVALID_TOKEN");
+    if (!token) {
+      throw new Error("Invalid or expired verification token");
     }
 
     await prisma.$transaction(async (tx) => {
-      await authRepository.markUserEmailVerified(tx, verificationToken.userId);
-      await authRepository.consumeEmailVerificationToken(tx, verificationToken.id);
+      await authRepository.consumeEmailVerificationToken(tx, token.id);
+      await authRepository.markUserEmailVerified(tx, token.userId);
+      await authRepository.clearEmailVerificationTokensByUserId(tx, token.userId);
     });
-
-    safeAuditLog({
-      action: AUTH_AUDIT_ACTIONS.EMAIL_VERIFIED,
-      entityType: "User",
-      entityId: verificationToken.userId,
-      actorUserId: verificationToken.userId,
-      metadata: {},
-      meta,
-    });
-
-    return { ok: true };
   },
 };

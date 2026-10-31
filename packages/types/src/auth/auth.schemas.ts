@@ -81,7 +81,7 @@ export const requestPasswordResetBodySchema = z.object({
 
 export const resetPasswordBodySchema = z.object({
   token: opaqueTokenSchema,
-  password: passwordSchema,
+  newPassword: passwordSchema,
 });
 
 export const changePasswordBodySchema = z.object({

@@ -1,6 +1,10 @@
-import { AUTH_SESSION_COOKIE_NAME, AUTH_SESSION_MAX_AGE_MS } from "@docket/types";
-import type { PublicSession, PublicUser } from "@docket/types";
-import type { CookieOptions, Request, Response } from "express";
+import {
+  AUTH_SESSION_COOKIE_NAME,
+  AUTH_SESSION_MAX_AGE_MS,
+  type PublicSession,
+  type PublicUser,
+} from "@docket/types";
+import type { CookieOptions, Response } from "express";
 import { createHash, randomBytes } from "node:crypto";
 import { env } from "../../config/env";
 import type {
@@ -41,7 +45,9 @@ export const toPublicUser = (user: UserPublicRow): PublicUser => {
     id: user.id,
     email: user.email,
     name: user.name,
-    emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
+    emailVerifiedAt: user.emailVerifiedAt
+      ? user.emailVerifiedAt.toISOString()
+      : null,
     lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
     createdAt: user.createdAt.toISOString(),
     updatedAt: user.updatedAt.toISOString(),
@@ -87,14 +93,23 @@ export const buildClearSessionCookieOptions = (): CookieOptions => {
 };
 
 export const setSessionCookie = (res: Response, sessionToken: string) => {
-  res.cookie(AUTH_SESSION_COOKIE_NAME, sessionToken, buildSessionCookieOptions());
+  res.cookie(
+    AUTH_SESSION_COOKIE_NAME,
+    sessionToken,
+    buildSessionCookieOptions(),
+  );
 };
 
 export const clearSessionCookie = (res: Response) => {
   res.clearCookie(AUTH_SESSION_COOKIE_NAME, buildClearSessionCookieOptions());
 };
 
-export const extractSessionToken = (req: Request) => {
+export const extractSessionToken = (req: {
+  cookies?: Record<string, string | undefined>;
+  headers: {
+    authorization?: string;
+  };
+}) => {
   const cookieToken = req.cookies?.[AUTH_SESSION_COOKIE_NAME];
 
   if (typeof cookieToken === "string" && cookieToken.length > 0) {
