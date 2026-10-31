@@ -1,9 +1,9 @@
 import { z } from "zod";
 import {
-  PASSWORD_MAX_LENGTH,
-  PASSWORD_MIN_LENGTH,
-  TOKEN_MAX_LENGTH,
-  TOKEN_MIN_LENGTH,
+  AUTH_OPAQUE_TOKEN_MAX_LENGTH,
+  AUTH_OPAQUE_TOKEN_MIN_LENGTH,
+  AUTH_PASSWORD_MAX_LENGTH,
+  AUTH_PASSWORD_MIN_LENGTH,
 } from "./auth.constants";
 
 const uuidSchema = z.string().uuid();
@@ -11,8 +11,15 @@ const isoDateTimeSchema = z.string().datetime();
 
 const emailSchema = z.string().trim().email().max(254);
 const nameSchema = z.string().trim().min(1).max(100);
-const passwordSchema = z.string().min(PASSWORD_MIN_LENGTH).max(PASSWORD_MAX_LENGTH);
-const tokenSchema = z.string().min(TOKEN_MIN_LENGTH).max(TOKEN_MAX_LENGTH);
+const passwordSchema = z
+  .string()
+  .min(AUTH_PASSWORD_MIN_LENGTH)
+  .max(AUTH_PASSWORD_MAX_LENGTH);
+
+const opaqueTokenSchema = z
+  .string()
+  .min(AUTH_OPAQUE_TOKEN_MIN_LENGTH)
+  .max(AUTH_OPAQUE_TOKEN_MAX_LENGTH);
 
 export const publicUserSchema = z.object({
   id: uuidSchema,
@@ -34,6 +41,23 @@ export const publicSessionSchema = z.object({
   createdAt: isoDateTimeSchema,
 });
 
+export const authResponseSchema = z.object({
+  user: publicUserSchema,
+  session: publicSessionSchema,
+});
+
+export const meResponseSchema = z.object({
+  user: publicUserSchema,
+});
+
+export const sessionListResponseSchema = z.object({
+  sessions: z.array(publicSessionSchema),
+});
+
+export const okResponseSchema = z.object({
+  ok: z.literal(true),
+});
+
 export const registerBodySchema = z.object({
   name: nameSchema,
   email: emailSchema,
@@ -42,32 +66,37 @@ export const registerBodySchema = z.object({
 
 export const loginBodySchema = z.object({
   email: emailSchema,
-  password: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  password: z.string().min(1).max(AUTH_PASSWORD_MAX_LENGTH),
 });
+
+export const refreshBodySchema = z.object({}).strict();
+
+export const logoutBodySchema = z.object({}).strict();
+
+export const logoutAllBodySchema = z.object({}).strict();
 
 export const requestPasswordResetBodySchema = z.object({
   email: emailSchema,
 });
 
 export const resetPasswordBodySchema = z.object({
-  token: tokenSchema,
+  token: opaqueTokenSchema,
   password: passwordSchema,
 });
 
-export const verifyEmailBodySchema = z.object({
-  token: tokenSchema,
-});
-
 export const changePasswordBodySchema = z.object({
-  currentPassword: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  currentPassword: z.string().min(1).max(AUTH_PASSWORD_MAX_LENGTH),
   newPassword: passwordSchema,
 });
 
-export const authResponseSchema = z.object({
-  user: publicUserSchema,
-  session: publicSessionSchema,
+export const verifyEmailBodySchema = z.object({
+  token: opaqueTokenSchema,
 });
 
-export const meResponseSchema = z.object({
-  user: publicUserSchema,
+export const requestEmailVerificationBodySchema = z.object({
+  email: emailSchema,
+});
+
+export const revokeSessionBodySchema = z.object({
+  sessionId: uuidSchema,
 });
