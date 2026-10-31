@@ -5,11 +5,15 @@
     "moduleResolution": "NodeNext",
     "esModuleInterop": true,
     "skipLibCheck": true,
-  },
-  "paths": {
+    "strict": true,
+    "types": ["node", "jest"],
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
       "@prisma/client": ["../../packages/db/node_modules/@prisma/client"],
       "@test/*": ["test/*"]
-    },
+    }
+  },
   "include": ["src/**/*", "test"],
   "exclude": ["node_modules", "dist"]
 }
