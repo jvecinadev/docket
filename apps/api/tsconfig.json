@@ -7,7 +7,8 @@
     "skipLibCheck": true,
   },
   "paths": {
-      "@prisma/client": ["../../packages/db/node_modules/@prisma/client"]
+      "@prisma/client": ["../../packages/db/node_modules/@prisma/client"],
+      "@test/*": ["test/*"]
     },
   "include": ["src/**/*", "test"],
   "exclude": ["node_modules", "dist"]

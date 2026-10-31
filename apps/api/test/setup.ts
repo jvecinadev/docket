@@ -1,5 +1,5 @@
 import { prisma } from '@docket/db';
-import { truncateAll } from '@test/helpers/db';
+import { truncateAll } from './helpers/db';
 
 beforeEach(async () => {
   await truncateAll();
