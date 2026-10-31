@@ -1,5 +1,0 @@
-allowBuilds:
-  '@prisma/engines': set this to true or false
-  prisma: set this to true or false
-minimumReleaseAgeExclude:
-  - '@types/node@26.6.6'
