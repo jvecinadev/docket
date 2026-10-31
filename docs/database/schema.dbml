@@ -1,0 +1,351 @@
+Project DocumentExtraction {
+  database_type: 'PostgreSQL'
+  Note: 'DBML converted from the supplied Prisma schema.'
+}
+
+Enum WorkspaceRole {
+  OWNER
+  MEMBER
+  REVIEWER
+}
+
+Enum DocumentStatus {
+  UPLOADED
+  PARSING
+  EXTRACTED
+  REVIEWED
+  FAILED
+}
+
+Enum DocumentTextSource {
+  PDF_TEXT
+  OCR
+  COMBINED
+}
+
+Enum ModelRole {
+  TEACHER
+  STUDENT
+}
+
+Enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+Enum ExtractionProvider {
+  GEMINI
+  HF
+  OTHER
+}
+
+Table User {
+  id uuid [pk, default: `gen_random_uuid()`]
+  email varchar [unique, not null]
+  passwordHash varchar [not null]
+  name varchar
+  emailVerifiedAt timestamp
+  lastLoginAt timestamp
+  failedLoginCount int [not null, default: 0]
+  lockedUntil timestamp
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  Note: 'Prisma @updatedAt is maintained by Prisma.'
+}
+
+Table Workspace {
+  id uuid [pk, default: `gen_random_uuid()`]
+  ownerId uuid [not null]
+  name varchar [not null]
+  documentType varchar [not null]
+  activeModel varchar [not null, default: 'teacher']
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    ownerId
+  }
+}
+
+Table WorkspaceMember {
+  workspaceId uuid [not null]
+  userId uuid [not null]
+  role WorkspaceRole [not null, default: 'MEMBER']
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    (workspaceId, userId) [pk]
+    userId
+  }
+}
+
+Table WorkspaceSchema {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workspaceId uuid [not null]
+  version int [not null]
+  name varchar
+  schemaJson jsonb [not null]
+  isActive boolean [not null, default: false]
+  createdById uuid
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    (workspaceId, version) [unique]
+    (workspaceId, isActive)
+  }
+}
+
+Table Session {
+  id uuid [pk, default: `gen_random_uuid()`]
+  userId uuid [not null]
+  tokenHash varchar [not null, unique]
+  ipAddress varchar
+  userAgent varchar
+  lastUsedAt timestamp
+  expiresAt timestamp [not null]
+  revokedAt timestamp
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    userId
+    expiresAt
+  }
+}
+
+Table EmailVerificationToken {
+  id uuid [pk, default: `gen_random_uuid()`]
+  userId uuid [not null]
+  tokenHash varchar [not null, unique]
+  expiresAt timestamp [not null]
+  consumedAt timestamp
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    userId
+    expiresAt
+  }
+}
+
+Table PasswordResetToken {
+  id uuid [pk, default: `gen_random_uuid()`]
+  userId uuid [not null]
+  tokenHash varchar [not null, unique]
+  expiresAt timestamp [not null]
+  consumedAt timestamp
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    userId
+    expiresAt
+  }
+}
+
+Table Document {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workspaceId uuid [not null]
+  uploadedById uuid
+  filename varchar [not null]
+  storageUrl varchar [not null]
+  storageKey varchar
+  mimeType varchar
+  pageCount int
+  sha256 varchar
+  status DocumentStatus [not null, default: 'UPLOADED']
+  errorMessage varchar
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    (workspaceId, createdAt)
+    (workspaceId, status)
+    sha256
+  }
+}
+
+Table DocumentText {
+  id uuid [pk, default: `gen_random_uuid()`]
+  documentId uuid [not null]
+  source DocumentTextSource [not null]
+  text text [not null]
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    (documentId, createdAt)
+  }
+}
+
+Table ExtractionRun {
+  id uuid [pk, default: `gen_random_uuid()`]
+  documentId uuid [not null]
+  schemaId uuid
+  modelRole ModelRole [not null]
+  provider ExtractionProvider [not null]
+  modelName varchar [not null]
+  promptVersion varchar [not null]
+  inputJson jsonb
+  outputJson jsonb
+  parsedOk boolean [not null, default: false]
+  status RunStatus [not null, default: 'PENDING']
+  latencyMs int
+  inputTokens int
+  outputTokens int
+  costUsd decimal(10,4)
+  traceId varchar
+  errorMessage varchar
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    (documentId, createdAt)
+    (modelRole, createdAt)
+    schemaId
+  }
+}
+
+Table ExtractionFieldValue {
+  id uuid [pk, default: `gen_random_uuid()`]
+  extractionRunId uuid [not null]
+  fieldKey varchar [not null]
+  predictedValue varchar
+  normalizedValue varchar
+  confidence decimal(5,4)
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    (extractionRunId, fieldKey) [unique]
+    fieldKey
+  }
+}
+
+Table Correction {
+  id uuid [pk, default: `gen_random_uuid()`]
+  documentId uuid [not null]
+  extractionRunId uuid
+  reviewerId uuid
+  correctedJson jsonb [not null]
+  isTrainingExample boolean [not null, default: true]
+  notes varchar
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    (documentId, createdAt)
+    extractionRunId
+    reviewerId
+  }
+}
+
+Table TrainingRun {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workspaceId uuid [not null]
+  baseModel varchar [not null]
+  adapterPath varchar
+  datasetVersion varchar
+  hyperparams jsonb
+  status RunStatus [not null, default: 'PENDING']
+  startedAt timestamp
+  completedAt timestamp
+  errorMessage varchar
+  createdAt timestamp [not null, default: `now()`]
+  updatedAt timestamp [not null]
+
+  indexes {
+    (workspaceId, createdAt)
+    status
+  }
+}
+
+Table EvaluationRun {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workspaceId uuid [not null]
+  trainingRunId uuid
+  gitSha varchar
+  modelVersion varchar [not null]
+  datasetVersion varchar
+  fieldAccuracy decimal(5,4)
+  exactMatchRate decimal(5,4)
+  f1Score decimal(5,4)
+  precision decimal(5,4)
+  recall decimal(5,4)
+  testSetSize int [not null]
+  passedGate boolean [not null, default: false]
+  status RunStatus [not null, default: 'PENDING']
+  metrics jsonb
+  thresholds jsonb
+  createdAt timestamp [not null, default: `now()`]
+  finishedAt timestamp
+
+  indexes {
+    (workspaceId, createdAt)
+    trainingRunId
+    status
+  }
+}
+
+Table EvaluationResult {
+  id uuid [pk, default: `gen_random_uuid()`]
+  evaluationRunId uuid [not null]
+  documentId uuid [not null]
+  fieldKey varchar [not null]
+  expectedValue varchar
+  predictedValue varchar
+  isCorrect boolean [not null]
+  score decimal(5,4)
+  notes varchar
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    (evaluationRunId, documentId, fieldKey) [unique]
+    (evaluationRunId, fieldKey)
+    documentId
+  }
+}
+
+Table AuditLog {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workspaceId uuid
+  actorUserId uuid
+  action varchar [not null]
+  entityType varchar [not null]
+  entityId varchar
+  metadata jsonb
+  ipAddress varchar
+  userAgent varchar
+  requestId varchar
+  createdAt timestamp [not null, default: `now()`]
+
+  indexes {
+    (workspaceId, createdAt)
+    (actorUserId, createdAt)
+    (action, createdAt)
+  }
+}
+
+Ref: Workspace.ownerId > User.id [delete: cascade]
+Ref: WorkspaceMember.workspaceId > Workspace.id [delete: cascade]
+Ref: WorkspaceMember.userId > User.id [delete: cascade]
+Ref: WorkspaceSchema.workspaceId > Workspace.id [delete: cascade]
+Ref: WorkspaceSchema.createdById > User.id [delete: set null]
+Ref: Session.userId > User.id [delete: cascade]
+Ref: EmailVerificationToken.userId > User.id [delete: cascade]
+Ref: PasswordResetToken.userId > User.id [delete: cascade]
+Ref: Document.workspaceId > Workspace.id [delete: cascade]
+Ref: Document.uploadedById > User.id [delete: set null]
+Ref: DocumentText.documentId > Document.id [delete: cascade]
+Ref: ExtractionRun.documentId > Document.id [delete: cascade]
+Ref: ExtractionRun.schemaId > WorkspaceSchema.id [delete: set null]
+Ref: ExtractionFieldValue.extractionRunId > ExtractionRun.id [delete: cascade]
+Ref: Correction.documentId > Document.id [delete: cascade]
+Ref: Correction.extractionRunId > ExtractionRun.id [delete: set null]
+Ref: Correction.reviewerId > User.id [delete: set null]
+Ref: TrainingRun.workspaceId > Workspace.id [delete: cascade]
+Ref: EvaluationRun.workspaceId > Workspace.id [delete: cascade]
+Ref: EvaluationRun.trainingRunId > TrainingRun.id [delete: set null]
+Ref: EvaluationResult.evaluationRunId > EvaluationRun.id [delete: cascade]
+Ref: EvaluationResult.documentId > Document.id [delete: cascade]
+Ref: AuditLog.workspaceId > Workspace.id [delete: set null]
+Ref: AuditLog.actorUserId > User.id [delete: set null]
